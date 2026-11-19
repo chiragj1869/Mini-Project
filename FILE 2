@@ -1,0 +1,139 @@
+File 2 — type: data_pipeline/02_join_dataset.py
+
+
+
+#!/usr/bin/env python3
+"""Join MyNeta + Wikipedia results + serious-case ids into realdata.json (v2)."""
+import json, re, os
+from pathlib import Path
+S = str(Path(__file__).resolve().parent / "outputs")
+
+ALIAS = {  # wiki-normalized -> myneta-normalized spelling
+    'NAVAPUR ST': 'NAWAPUR ST', 'SINDKHEDA': 'SINDHKHEDA', 'CHIKHALI': 'CHIKHLI',
+    'SINDKHED RAJA': 'SINDHKHED RAJA', 'GONDIYA': 'GONDIA', 'GHANSAWANGI': 'GANSAVANGI',
+    'PHULAMBRI': 'PHOLAMBARI', 'AMBERNATH SC': 'AMBARNATH SC', 'MIRA BHAYANDAR': 'MEERA BHAYANDAR',
+    'MANKHURD SHIVAJI NAGAR': 'MANKHURD SHIVAJINAGAR', 'SANGAMNER': 'SANGMNER',
+    'KHANAPUR': 'KHANPUR', 'TASGAON': 'TASGAON KAVATHE MAHANKAL', 'JATH': 'JAT',
+}
+
+def norm(ac):
+    ac = ac.split(' : ')[0]
+    ac = ac.upper().replace('-', ' ').replace('(', ' ').replace(')', ' ')
+    return re.sub(r'\s+', ' ', ac.strip())
+
+consts = json.load(open(f"{S}/consts_data.json"))
+results = json.load(open(f"{S}/results.json"))
+serious = set(open(f"{S}/serious_ids.txt").read().split())
+
+# classify const pages: GE vs bypoll; index by normalized ac
+pages = {}
+for k, v in consts.items():
+    isbye = 'BYE ELECTION' in v['district'].upper()
+    key = norm(v['ac'])
+    pages.setdefault(key, []).append({'id': int(k), 'ge': not isbye, 'bye': isbye, 'v': v})
+
+res_by = {norm(r['ac']): r for r in results}
+print(f"ACs: results {len(res_by)} | const pages {len(consts)} | distinct ACs {len(pages)}")
+
+# winners pages union, keyed by norm|bye
+wpages = {}
+for sort in ("rendered", "criminal", "asset", "default"):
+    p = f"{S}/winners_{sort}.json"
+    if not os.path.exists(p):
+        continue
+    for r in json.load(open(p)):
+        key = norm(r["ac"]) + ("|BYE" if "BYE ELECTION" in r["ac"].upper() else "")
+        ex = wpages.get(key)
+        if ex is None or (ex["assets"] == 0 and r["assets"] > 0):
+            wpages[key] = r
+
+EDU = sorted({c["edu"] for v in consts.values() for c in v["cands"]})
+PARTIES = sorted({c["party"] for v in consts.values() for c in v["cands"]})
+
+def resolve(ac_norm):
+    if ac_norm in pages:
+        return ac_norm
+    return ALIAS.get(ac_norm, ac_norm)
+
+mlas, consts_out, problems = [], [], []
+for ac, r in sorted(res_by.items(), key=lambda kv: kv[1]["no"]):
+    key = resolve(ac)
+    plist = pages.get(key)
+    if not plist:
+        problems.append(f"NO CONST PAGE: {ac}")
+        continue
+    ge = next((p for p in plist if p['ge']), None)
+    bye = next((p for p in plist if p['bye']), None)
+    main = bye or ge
+    v = main['v']
+    won_c = next((c for c in v["cands"] if c["won"]), None)
+    if won_c is None:
+        # try matching wiki 2024 winner name in the roster
+        wn = norm(r["wcand"])
+        for c in v["cands"]:
+            cn = norm(c["name"])
+            if wn == cn or wn in cn or cn in wn:
+                won_c = c
+                problems.append(f"WINNER VIA NAME-MATCH: {r['ac']} -> {c['name']}")
+                break
+    if won_c is None:
+        problems.append(f"NO WINNER: {r['ac']} (roster: {[c['name'][:20] for c in v['cands'][:4]]})")
+        continue
+    wkey = key + ("|BYE" if main['bye'] else "")
+    wr = wpages.get(wkey) or wpages.get(key) or {}
+    assets = won_c["assets"] or wr.get("assets", 0)
+    liab = won_c["liab"] or wr.get("liab", 0)
+    cases = won_c["cases"] or wr.get("cases", 0)
+    isbye = bool(main['bye'])
+    mlas.append({
+        "cid": won_c["cid"], "name": won_c["name"], "ac": r["ac"], "acno": r["no"],
+        "district": r["district"], "party": won_c["party"], "cases": cases,
+        "serious": won_c["cid"] in serious, "edu": won_c["edu"], "age": won_c["age"],
+        "assets": assets, "liab": liab, "votes": r["wvotes"], "share": r["wshare"],
+        "margin": r["margin"], "rcand": r["rcand"], "rparty": r["rparty"], "rvotes": r["rvotes"],
+        "bye": isbye, "constId": main['id'],
+        "prevMLA": (wpages.get(key) or {}).get("name", "") if isbye else "",
+    })
+    def pack(page):
+        cands = [[c["cid"], c["name"], PARTIES.index(c["party"]), c["cases"], EDU.index(c["edu"]),
+                  c["age"], c["assets"], c["liab"], 1 if c["won"] else 0] for c in page['v']["cands"]]
+        return {"id": page['id'], "isbye": page['bye'], "cands": cands}
+    rec = {
+        "ac": r["ac"], "acno": r["no"], "district": r["district"],
+        "wcand": r["wcand"], "wparty": r["wparty"], "wvotes": r["wvotes"], "wshare": r["wshare"],
+        "rcand": r["rcand"], "rparty": r["rparty"], "rvotes": r["rvotes"], "rshare": r["rshare"],
+        "margin": r["margin"], "bye": isbye, "ge": pack(ge) if ge else None, "cur": pack(main),
+    }
+    consts_out.append(rec)
+
+print(f"\nMLAs: {len(mlas)} | const records: {len(consts_out)}")
+crore = sum(1 for m in mlas if m["assets"] >= 10**7)
+withc = sum(1 for m in mlas if m["cases"] > 0)
+ser = sum(1 for m in mlas if m["serious"])
+grads = sum(1 for m in mlas if m["edu"] in ("Graduate", "Graduate Professional", "Post Graduate", "Doctorate"))
+tot = sum(m["assets"] for m in mlas)
+print(f"VERIFY vs ADR: crorepatis {crore}/279 | cases {withc}/188 | serious {ser}/116 | grad+ {grads}/168")
+print(f"total declared assets: Rs {tot:,}")
+print("bye seats:", [(m['ac'], m['name'], m['prevMLA']) for m in mlas if m['bye']])
+print("zero-asset winners:", [m['name'] for m in mlas if m['assets'] == 0])
+print("\nPROBLEMS:")
+for p in problems:
+    print(" ", p)
+
+out = {
+    "meta": {
+        "mlas": len(mlas), "crorepatis": crore, "withCases": withc, "serious": ser,
+        "grads": grads, "totalAssets": tot,
+        "candidates": sum(len(c["cur"]["cands"]) + (len(c["ge"]["cands"]) if c["ge"] else 0) for c in consts_out),
+        "parties": PARTIES, "edu": EDU,
+        "sources": {
+            "affidavit": "ADR / MyNeta (myneta.info) — self-sworn Form 26 affidavits, Maharashtra Assembly Election 2024 (updated for 2026 bye-elections)",
+            "results": "Election Commission of India results as compiled in the public constituency record",
+            "adrChecks": "ADR Maharashtra 2024 winners analysis: 279/288 crorepatis, 188 with declared cases, 116 with serious cases, 168 graduates+",
+        },
+    },
+    "mlas": mlas,
+    "consts": consts_out,
+}
+json.dump(out, open(f"{S}/realdata.json", "w"), ensure_ascii=False)
+print("\nWROTE realdata.json:", os.path.getsize(f"{S}/realdata.json"), "bytes")
